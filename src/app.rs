@@ -48,9 +48,9 @@ impl SendInput {
         }
 
         for token in trimmed.split_whitespace() {
-            if token.len() > 2 || !token.chars().all(|c| c.is_ascii_hexdigit()) {
+            if token.len() != 2 || !token.chars().all(|c| c.is_ascii_hexdigit()) {
                 self.hex_error = Some(format!(
-                    "'{}' 不是有效的 HEX 字节（格式示例: 01 A5 FF）",
+                    "'{}' 不是有效的 HEX 字节（需要恰好两位十六进制字符，格式示例: 01 A5 FF）",
                     token
                 ));
                 return;
