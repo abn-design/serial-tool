@@ -47,14 +47,9 @@ impl SerialConnection {
         })
     }
 
-    pub fn send_strings(&self, payloads: &[String]) -> Result<(), String> {
-        let batch = payloads
-            .iter()
-            .map(|text| text.as_bytes().to_vec())
-            .collect::<Vec<_>>();
-
+    pub fn send_bytes(&self, payloads: Vec<Vec<u8>>) -> Result<(), String> {
         self.cmd_tx
-            .send(WorkerCommand::SendBatch(batch))
+            .send(WorkerCommand::SendBatch(payloads))
             .map_err(|_| "串口后台线程已退出".to_owned())
     }
 
