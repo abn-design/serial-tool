@@ -20,14 +20,70 @@ struct StatusBanner {
     is_error: bool,
 }
 
+struct SendInput {
+    text: String,
+    is_hex: bool,
+    hex_error: Option<String>,
+}
+
+impl SendInput {
+    fn new() -> Self {
+        Self {
+            text: String::new(),
+            is_hex: false,
+            hex_error: None,
+        }
+    }
+
+    fn validate(&mut self) {
+        if !self.is_hex {
+            self.hex_error = None;
+            return;
+        }
+
+        let trimmed = self.text.trim();
+        if trimmed.is_empty() {
+            self.hex_error = None;
+            return;
+        }
+
+        for token in trimmed.split_whitespace() {
+            if token.len() > 2 || !token.chars().all(|c| c.is_ascii_hexdigit()) {
+                self.hex_error = Some(format!(
+                    "'{}' 不是有效的 HEX 字节（格式示例: 01 A5 FF）",
+                    token
+                ));
+                return;
+            }
+        }
+        self.hex_error = None;
+    }
+
+    fn to_bytes(&self) -> Result<Vec<u8>, String> {
+        if self.is_hex {
+            self.text
+                .trim()
+                .split_whitespace()
+                .map(|token| {
+                    u8::from_str_radix(token, 16)
+                        .map_err(|_| format!("'{}' 不是有效的十六进制值", token))
+                })
+                .collect()
+        } else {
+            Ok(self.text.as_bytes().to_vec())
+        }
+    }
+}
+
 pub struct SerialToolApp {
     ports: Vec<String>,
     selected_port: Option<String>,
     baud_rates: Vec<u32>,
     selected_baud: u32,
     connection: Option<SerialConnection>,
-    receive_log: Vec<String>,
-    send_inputs: Vec<String>,
+    receive_log: Vec<(String, Vec<u8>)>,
+    receive_as_hex: bool,
+    send_inputs: Vec<SendInput>,
     interval_options: Vec<u64>,
     selected_interval_ms: u64,
     continuous_enabled: bool,
@@ -37,7 +93,9 @@ pub struct SerialToolApp {
 }
 
 impl SerialToolApp {
-    pub fn new(_cc: &CreationContext<'_>) -> Self {
+    pub fn new(cc: &CreationContext<'_>) -> Self {
+        setup_fonts(&cc.egui_ctx);
+
         let mut app = Self {
             ports: Vec::new(),
             selected_port: None,
@@ -45,7 +103,8 @@ impl SerialToolApp {
             selected_baud: DEFAULT_BAUD_RATE,
             connection: None,
             receive_log: Vec::new(),
-            send_inputs: vec![String::new()],
+            receive_as_hex: false,
+            send_inputs: vec![SendInput::new()],
             interval_options: vec![100, 200, 500, 1000, 2000, 5000],
             selected_interval_ms: DEFAULT_INTERVAL_MS,
             continuous_enabled: false,
@@ -154,7 +213,8 @@ impl SerialToolApp {
     }
 
     fn push_receive_log(&mut self, bytes: Vec<u8>) {
-        self.receive_log.push(format_receive_entry(&bytes));
+        let timestamp = Local::now().format("%H:%M:%S%.3f").to_string();
+        self.receive_log.push((timestamp, bytes));
 
         if self.receive_log.len() > MAX_LOG_ENTRIES {
             let overflow = self.receive_log.len() - MAX_LOG_ENTRIES;
@@ -162,15 +222,27 @@ impl SerialToolApp {
         }
     }
 
-    fn collect_payloads(&self) -> Result<Vec<String>, String> {
-        let payloads = self
-            .send_inputs
-            .iter()
-            .filter(|text| !text.trim().is_empty())
-            .cloned()
-            .collect::<Vec<_>>();
+    fn collect_payloads(&self) -> Result<Vec<Vec<u8>>, String> {
+        let mut payloads = Vec::new();
+        let mut found_non_empty = false;
 
-        if payloads.is_empty() {
+        for (index, input) in self.send_inputs.iter().enumerate() {
+            if input.text.trim().is_empty() {
+                continue;
+            }
+            found_non_empty = true;
+
+            if input.is_hex && input.hex_error.is_some() {
+                return Err(format!(
+                    "数据 {} 包含无效的 HEX 格式，请修正后再发送",
+                    index + 1
+                ));
+            }
+
+            payloads.push(input.to_bytes()?);
+        }
+
+        if !found_non_empty {
             return Err("请至少填写一条发送数据".to_owned());
         }
 
@@ -191,7 +263,7 @@ impl SerialToolApp {
             }
         };
 
-        match connection.send_strings(&payloads) {
+        match connection.send_bytes(payloads) {
             Ok(()) => true,
             Err(err) => {
                 self.continuous_active = false;
@@ -262,6 +334,7 @@ impl eframe::App for SerialToolApp {
         let mut open_or_close_requested = false;
         let mut send_requested = false;
         let mut add_input_requested = false;
+        let mut remove_input_index: Option<usize> = None;
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("Rust 串口工具");
@@ -307,6 +380,8 @@ impl eframe::App for SerialToolApp {
                 if ui.button(button_text).clicked() {
                     open_or_close_requested = true;
                 }
+
+                ui.checkbox(&mut self.receive_as_hex, "HEX 显示");
             });
 
             if let Some(status) = &self.status {
@@ -321,14 +396,22 @@ impl eframe::App for SerialToolApp {
 
             ui.separator();
             ui.label("接收数据");
+
+            let receive_height = (ui.available_height() - 160.0).max(150.0);
             ScrollArea::vertical()
-                .max_height(280.0)
+                .max_height(receive_height)
                 .stick_to_bottom(true)
                 .show(ui, |ui| {
                     if self.receive_log.is_empty() {
                         ui.weak("暂无接收数据");
                     } else {
-                        for line in &self.receive_log {
+                        let as_hex = self.receive_as_hex;
+                        for (timestamp, bytes) in &self.receive_log {
+                            let line = if as_hex {
+                                format_receive_hex(timestamp, bytes)
+                            } else {
+                                format_receive_text(timestamp, bytes)
+                            };
                             ui.monospace(line);
                         }
                     }
@@ -337,19 +420,41 @@ impl eframe::App for SerialToolApp {
             ui.separator();
             ui.label("发送数据");
 
-            let last_input_index = self.send_inputs.len().saturating_sub(1);
+            let input_count = self.send_inputs.len();
+            let last_input_index = input_count.saturating_sub(1);
+            let can_remove = input_count > 1;
 
             for (index, input) in self.send_inputs.iter_mut().enumerate() {
                 ui.horizontal(|ui| {
                     ui.label(format!("数据 {}", index + 1));
-                    ui.add(
-                        TextEdit::singleline(input)
-                            .desired_width(420.0)
-                            .hint_text("输入要发送的文本"),
+
+                    let hint =
+                        if input.is_hex { "例如: 01 02 0A FF" } else { "输入要发送的文本" };
+                    let response = ui.add(
+                        TextEdit::singleline(&mut input.text)
+                            .desired_width(360.0)
+                            .hint_text(hint),
                     );
+
+                    if response.changed() {
+                        input.validate();
+                    }
+
+                    if ui.checkbox(&mut input.is_hex, "HEX").changed() {
+                        input.validate();
+                    }
+
+                    if let Some(ref err) = input.hex_error {
+                        ui.label(RichText::new("⚠").color(Color32::from_rgb(220, 70, 70)))
+                            .on_hover_text(err.as_str());
+                    }
 
                     if index == last_input_index && ui.button("Add").clicked() {
                         add_input_requested = true;
+                    }
+
+                    if can_remove && ui.button("✕").clicked() {
+                        remove_input_index = Some(index);
                     }
                 });
             }
@@ -387,8 +492,12 @@ impl eframe::App for SerialToolApp {
             self.next_continuous_send_at = None;
         }
 
+        if let Some(idx) = remove_input_index {
+            self.send_inputs.remove(idx);
+        }
+
         if add_input_requested {
-            self.send_inputs.push(String::new());
+            self.send_inputs.push(SendInput::new());
         }
 
         if refresh_requested {
@@ -413,17 +522,61 @@ impl eframe::App for SerialToolApp {
     }
 }
 
-fn format_receive_entry(bytes: &[u8]) -> String {
-    let timestamp = Local::now().format("%H:%M:%S%.3f");
+fn setup_fonts(ctx: &egui::Context) {
+    #[cfg(target_os = "windows")]
+    let font_paths: &[&str] = &[
+        "C:/Windows/Fonts/msyh.ttc",
+        "C:/Windows/Fonts/simsun.ttc",
+        "C:/Windows/Fonts/simhei.ttf",
+    ];
+
+    #[cfg(target_os = "macos")]
+    let font_paths: &[&str] = &[
+        "/System/Library/Fonts/PingFang.ttc",
+        "/System/Library/Fonts/STHeiti Light.ttc",
+    ];
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let font_paths: &[&str] = &[
+        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+        "/usr/share/fonts/wqy-microhei/wqy-microhei.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/noto/NotoSansCJK-Regular.ttc",
+    ];
+
+    for path in font_paths {
+        if let Ok(data) = std::fs::read(path) {
+            let mut fonts = egui::FontDefinitions::default();
+            fonts
+                .font_data
+                .insert("cjk_font".to_owned(), egui::FontData::from_owned(data).into());
+            if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+                family.push("cjk_font".to_owned());
+            }
+            if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
+                family.push("cjk_font".to_owned());
+            }
+            ctx.set_fonts(fonts);
+            return;
+        }
+    }
+}
+
+fn format_receive_hex(timestamp: &str, bytes: &[u8]) -> String {
     let hex = bytes
         .iter()
         .map(|byte| format!("{byte:02X}"))
         .collect::<Vec<_>>()
         .join(" ");
+    format!("[{timestamp}] {hex}")
+}
 
+fn format_receive_text(timestamp: &str, bytes: &[u8]) -> String {
     let text = String::from_utf8_lossy(bytes)
         .replace('\r', "\\r")
         .replace('\n', "\\n");
-
-    format!("[{timestamp}] HEX {hex} | TXT {text}")
+    format!("[{timestamp}] {text}")
 }
