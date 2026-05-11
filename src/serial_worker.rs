@@ -79,7 +79,6 @@ fn worker_loop(
     event_tx: Sender<WorkerEvent>,
 ) {
     let mut buffer = [0_u8; 4096];
-    let mut close_message = None;
 
     loop {
         match cmd_rx.try_recv() {
@@ -91,15 +90,11 @@ fn worker_loop(
                     }
                 }
             }
-            Ok(WorkerCommand::Close) => {
-                close_message = Some("串口已关闭".to_owned());
-                break;
+            Ok(WorkerCommand::Close) | Err(TryRecvError::Disconnected) => {
+                let _ = event_tx.send(WorkerEvent::Closed("串口已关闭".to_owned()));
+                return;
             }
             Err(TryRecvError::Empty) => {}
-            Err(TryRecvError::Disconnected) => {
-                close_message = Some("串口已关闭".to_owned());
-                break;
-            }
         }
 
         match port.read(&mut buffer) {
@@ -113,9 +108,5 @@ fn worker_loop(
                 return;
             }
         }
-    }
-
-    if let Some(message) = close_message {
-        let _ = event_tx.send(WorkerEvent::Closed(message));
     }
 }
