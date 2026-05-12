@@ -82,6 +82,7 @@ pub struct SerialToolApp {
     selected_baud: u32,
     connection: Option<SerialConnection>,
     receive_log: Vec<(String, Vec<u8>)>,
+    send_log: Vec<(String, Vec<u8>)>,
     receive_as_hex: bool,
     send_inputs: Vec<SendInput>,
     interval_options: Vec<u64>,
@@ -103,6 +104,7 @@ impl SerialToolApp {
             selected_baud: DEFAULT_BAUD_RATE,
             connection: None,
             receive_log: Vec::new(),
+            send_log: Vec::new(),
             receive_as_hex: false,
             send_inputs: vec![SendInput::new()],
             interval_options: vec![100, 200, 500, 1000, 2000, 5000],
@@ -120,7 +122,10 @@ impl SerialToolApp {
     fn refresh_ports(&mut self) {
         match serialport::available_ports() {
             Ok(ports) => {
-                let mut names = ports.into_iter().map(|port| port.port_name).collect::<Vec<_>>();
+                let mut names = ports
+                    .into_iter()
+                    .map(|port| port.port_name)
+                    .collect::<Vec<_>>();
                 names.sort();
 
                 self.ports = names;
@@ -222,6 +227,16 @@ impl SerialToolApp {
         }
     }
 
+    fn push_send_log(&mut self, bytes: Vec<u8>) {
+        let timestamp = Local::now().format("%H:%M:%S%.3f").to_string();
+        self.send_log.push((timestamp, bytes));
+
+        if self.send_log.len() > MAX_LOG_ENTRIES {
+            let overflow = self.send_log.len() - MAX_LOG_ENTRIES;
+            self.send_log.drain(0..overflow);
+        }
+    }
+
     fn collect_payloads(&self) -> Result<Vec<Vec<u8>>, String> {
         let mut payloads = Vec::new();
         let mut found_non_empty = false;
@@ -250,11 +265,6 @@ impl SerialToolApp {
     }
 
     fn send_payloads(&mut self) -> bool {
-        let Some(connection) = self.connection.as_ref() else {
-            self.set_status("请先打开串口".to_owned(), true);
-            return false;
-        };
-
         let payloads = match self.collect_payloads() {
             Ok(payloads) => payloads,
             Err(err) => {
@@ -263,7 +273,21 @@ impl SerialToolApp {
             }
         };
 
-        match connection.send_bytes(payloads) {
+        // Log what we're about to send
+        for bytes in &payloads {
+            self.push_send_log(bytes.clone());
+        }
+
+        // Short-lived borrow of connection for sending
+        let result = match self.connection.as_ref() {
+            Some(conn) => conn.send_bytes(payloads),
+            None => {
+                self.set_status("请先打开串口".to_owned(), true);
+                return false;
+            }
+        };
+
+        match result {
             Ok(()) => true,
             Err(err) => {
                 self.continuous_active = false;
@@ -337,10 +361,6 @@ impl eframe::App for SerialToolApp {
         let mut remove_input_index: Option<usize> = None;
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Rust 串口工具");
-            ui.label("原生桌面 UI，支持 Windows 和 Linux");
-            ui.separator();
-
             ui.horizontal(|ui| {
                 ui.add_enabled_ui(!is_open, |ui| {
                     egui::ComboBox::from_label("设备列表")
@@ -395,95 +415,157 @@ impl eframe::App for SerialToolApp {
             }
 
             ui.separator();
-            ui.label("接收数据");
 
-            let receive_height = (ui.available_height() - 160.0).max(150.0);
-            ScrollArea::vertical()
-                .max_height(receive_height)
-                .stick_to_bottom(true)
-                .show(ui, |ui| {
-                    if self.receive_log.is_empty() {
-                        ui.weak("暂无接收数据");
-                    } else {
-                        let as_hex = self.receive_as_hex;
-                        for (timestamp, bytes) in &self.receive_log {
-                            let line = if as_hex {
-                                format_receive_hex(timestamp, bytes)
+            ui.columns(2, |columns| {
+                // ═══════════ Left column: Send ═══════════
+                columns[0].vertical(|ui| {
+                    // -- Send log --
+                    ui.label("发送数据");
+
+                    let input_count = self.send_inputs.len() as f32;
+                    let controls_height = 85.0 + input_count * 28.0;
+                    let scroll_height = (ui.available_height() - controls_height).max(80.0);
+
+                    egui::Frame::group(ui.style())
+                        .outer_margin(egui::Margin::symmetric(8, 8))
+                        .inner_margin(egui::Margin::symmetric(4, 4))
+                        .show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            ui.set_min_height(scroll_height);
+                            ScrollArea::vertical()
+                                .id_salt("send_data")
+                                .max_height(scroll_height)
+                                .stick_to_bottom(true)
+                                .show(ui, |ui| {
+                                    if self.send_log.is_empty() {
+                                        ui.weak("暂无发送数据");
+                                    } else {
+                                        let as_hex = self.receive_as_hex;
+                                        for (timestamp, bytes) in &self.send_log {
+                                            let line = if as_hex {
+                                                format_receive_hex(timestamp, bytes)
+                                            } else {
+                                                format_receive_text(timestamp, bytes)
+                                            };
+                                            ui.monospace(line);
+                                        }
+                                    }
+                                });
+                        });
+
+                    ui.separator();
+
+                    // -- Send controls --
+                    let input_count = self.send_inputs.len();
+                    let last_input_index = input_count.saturating_sub(1);
+                    let can_remove = input_count > 1;
+
+                    for (index, input) in self.send_inputs.iter_mut().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.set_min_width(ui.available_width());
+                            ui.label(format!("数据 {}", index + 1));
+
+                            let hint = if input.is_hex {
+                                "例如: 01 02 0A FF"
                             } else {
-                                format_receive_text(timestamp, bytes)
+                                "输入要发送的文本"
                             };
-                            ui.monospace(line);
-                        }
-                    }
-                });
+                            let response = ui.add(
+                                TextEdit::singleline(&mut input.text)
+                                    .desired_width(200.0)
+                                    .hint_text(hint),
+                            );
 
-            ui.separator();
-            ui.label("发送数据");
+                            if response.changed() {
+                                input.validate();
+                            }
 
-            let input_count = self.send_inputs.len();
-            let last_input_index = input_count.saturating_sub(1);
-            let can_remove = input_count > 1;
+                            if ui.checkbox(&mut input.is_hex, "HEX").changed() {
+                                input.validate();
+                            }
 
-            for (index, input) in self.send_inputs.iter_mut().enumerate() {
-                ui.horizontal(|ui| {
-                    ui.label(format!("数据 {}", index + 1));
+                            if let Some(ref err) = input.hex_error {
+                                ui.label(
+                                    RichText::new("\u{26a0}").color(Color32::from_rgb(220, 70, 70)),
+                                )
+                                .on_hover_text(err.as_str());
+                            }
 
-                    let hint =
-                        if input.is_hex { "例如: 01 02 0A FF" } else { "输入要发送的文本" };
-                    let response = ui.add(
-                        TextEdit::singleline(&mut input.text)
-                            .desired_width(360.0)
-                            .hint_text(hint),
-                    );
+                            if index == last_input_index && ui.button("Add").clicked() {
+                                add_input_requested = true;
+                            }
 
-                    if response.changed() {
-                        input.validate();
-                    }
-
-                    if ui.checkbox(&mut input.is_hex, "HEX").changed() {
-                        input.validate();
-                    }
-
-                    if let Some(ref err) = input.hex_error {
-                        ui.label(RichText::new("⚠").color(Color32::from_rgb(220, 70, 70)))
-                            .on_hover_text(err.as_str());
-                    }
-
-                    if index == last_input_index && ui.button("Add").clicked() {
-                        add_input_requested = true;
-                    }
-
-                    if can_remove && ui.button("✕").clicked() {
-                        remove_input_index = Some(index);
-                    }
-                });
-            }
-
-            ui.separator();
-            ui.horizontal(|ui| {
-                let send_label = if self.continuous_active { "Stop" } else { "Send" };
-                if ui
-                    .add_enabled(self.connection.is_some(), egui::Button::new(send_label))
-                    .clicked()
-                {
-                    send_requested = true;
-                }
-
-                ui.checkbox(&mut self.continuous_enabled, "持续发送");
-
-                if self.continuous_enabled {
-                    egui::ComboBox::from_label("时间间隔")
-                        .selected_text(format!("{} ms", self.selected_interval_ms))
-                        .show_ui(ui, |ui| {
-                            for interval in &self.interval_options {
-                                ui.selectable_value(
-                                    &mut self.selected_interval_ms,
-                                    *interval,
-                                    format!("{} ms", interval),
-                                );
+                            if can_remove && ui.button("Del").clicked() {
+                                remove_input_index = Some(index);
                             }
                         });
-                }
+                    }
+
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        let send_label = if self.continuous_active {
+                            "Stop"
+                        } else {
+                            "Send"
+                        };
+                        if ui
+                            .add_enabled(self.connection.is_some(), egui::Button::new(send_label))
+                            .clicked()
+                        {
+                            send_requested = true;
+                        }
+
+                        ui.checkbox(&mut self.continuous_enabled, "持续发送");
+
+                        if self.continuous_enabled {
+                            egui::ComboBox::from_label("时间间隔")
+                                .selected_text(format!("{} ms", self.selected_interval_ms))
+                                .show_ui(ui, |ui| {
+                                    for interval in &self.interval_options {
+                                        ui.selectable_value(
+                                            &mut self.selected_interval_ms,
+                                            *interval,
+                                            format!("{} ms", interval),
+                                        );
+                                    }
+                                });
+                        }
+                    });
+                });
+
+                // ═══════════ Right column: Receive ═══════════
+                columns[1].vertical(|ui| {
+                    ui.label("接收数据");
+
+                    let scroll_height = ui.available_height() - 32.0;
+
+                    egui::Frame::group(ui.style())
+                        .outer_margin(egui::Margin::symmetric(8, 8))
+                        .inner_margin(egui::Margin::symmetric(4, 4))
+                        .show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            ui.set_min_height(scroll_height);
+                            ScrollArea::vertical()
+                                .id_salt("recv_data")
+                                .max_height(scroll_height)
+                                .stick_to_bottom(true)
+                                .show(ui, |ui| {
+                                    if self.receive_log.is_empty() {
+                                        ui.weak("暂无接收数据");
+                                    } else {
+                                        let as_hex = self.receive_as_hex;
+                                        for (timestamp, bytes) in &self.receive_log {
+                                            let line = if as_hex {
+                                                format_receive_hex(timestamp, bytes)
+                                            } else {
+                                                format_receive_text(timestamp, bytes)
+                                            };
+                                            ui.monospace(line);
+                                        }
+                                    }
+                                });
+                        });
+                });
             });
         });
 
@@ -550,9 +632,10 @@ fn setup_fonts(ctx: &egui::Context) {
     for path in font_paths {
         if let Ok(data) = std::fs::read(path) {
             let mut fonts = egui::FontDefinitions::default();
-            fonts
-                .font_data
-                .insert("cjk_font".to_owned(), egui::FontData::from_owned(data).into());
+            fonts.font_data.insert(
+                "cjk_font".to_owned(),
+                egui::FontData::from_owned(data).into(),
+            );
             if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
                 family.push("cjk_font".to_owned());
             }
