@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod app;
 mod serial_worker;
 
@@ -5,8 +7,7 @@ use app::SerialToolApp;
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([960.0, 720.0]),
+        viewport: eframe::egui::ViewportBuilder::default().with_inner_size([960.0, 720.0]),
         ..Default::default()
     };
 
