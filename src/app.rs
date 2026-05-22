@@ -427,7 +427,6 @@ impl eframe::App for SerialToolApp {
                     let scroll_height = (ui.available_height() - controls_height).max(80.0);
 
                     egui::Frame::group(ui.style())
-                        .outer_margin(egui::Margin::symmetric(8, 8))
                         .inner_margin(egui::Margin::symmetric(4, 4))
                         .show(ui, |ui| {
                             ui.set_min_width(ui.available_width());
@@ -436,6 +435,7 @@ impl eframe::App for SerialToolApp {
                                 .id_salt("send_data")
                                 .max_height(scroll_height)
                                 .stick_to_bottom(true)
+                                .auto_shrink([false, false])
                                 .show(ui, |ui| {
                                     if self.send_log.is_empty() {
                                         ui.weak("暂无发送数据");
@@ -447,7 +447,13 @@ impl eframe::App for SerialToolApp {
                                             } else {
                                                 format_receive_text(timestamp, bytes)
                                             };
-                                            ui.monospace(line);
+                                            // 替换 ui.monospace(line)
+                                            ui.add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(line).monospace(),
+                                                )
+                                                .wrap(),
+                                            );
                                         }
                                     }
                                 });
@@ -540,7 +546,6 @@ impl eframe::App for SerialToolApp {
                     let scroll_height = ui.available_height() - 32.0;
 
                     egui::Frame::group(ui.style())
-                        .outer_margin(egui::Margin::symmetric(8, 8))
                         .inner_margin(egui::Margin::symmetric(4, 4))
                         .show(ui, |ui| {
                             ui.set_min_width(ui.available_width());
@@ -549,6 +554,7 @@ impl eframe::App for SerialToolApp {
                                 .id_salt("recv_data")
                                 .max_height(scroll_height)
                                 .stick_to_bottom(true)
+                                .auto_shrink([false, false])
                                 .show(ui, |ui| {
                                     if self.receive_log.is_empty() {
                                         ui.weak("暂无接收数据");
@@ -560,7 +566,12 @@ impl eframe::App for SerialToolApp {
                                             } else {
                                                 format_receive_text(timestamp, bytes)
                                             };
-                                            ui.monospace(line);
+                                            ui.add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(line).monospace(),
+                                                )
+                                                .wrap(),
+                                            );
                                         }
                                     }
                                 });
