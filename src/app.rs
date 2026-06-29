@@ -759,7 +759,12 @@ fn config_file_path() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     let base_dir = env::var_os("APPDATA").map(PathBuf::from);
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    let base_dir = env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join("Library").join("Application Support"));
+
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
     let base_dir = env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")));
@@ -799,7 +804,7 @@ fn parse_config(contents: &str) -> AppConfig {
 
 fn parse_toml_string(value: &str) -> Option<String> {
     let trimmed = value.trim();
-    if !(trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2) {
+    if !(trimmed.starts_with('"') && trimmed.ends_with('"')) {
         return None;
     }
 
