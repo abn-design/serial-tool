@@ -804,11 +804,7 @@ fn parse_config(contents: &str) -> AppConfig {
 
 fn parse_toml_string(value: &str) -> Option<String> {
     let trimmed = value.trim();
-    if !(trimmed.starts_with('"') && trimmed.ends_with('"')) {
-        return None;
-    }
-
-    let inner = &trimmed[1..trimmed.len() - 1];
+    let inner = trimmed.strip_prefix('"')?.strip_suffix('"')?;
     let mut result = String::new();
     let mut chars = inner.chars();
 
