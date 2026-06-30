@@ -1,4 +1,6 @@
 use std::{
+    env, fs,
+    path::PathBuf,
     sync::mpsc::TryRecvError,
     time::{Duration, Instant},
 };
@@ -14,10 +16,64 @@ use crate::serial_worker::{SerialConnection, WorkerEvent};
 const MAX_LOG_ENTRIES: usize = 1000;
 const DEFAULT_BAUD_RATE: u32 = 115200;
 const DEFAULT_INTERVAL_MS: u64 = 1000;
+const CONFIG_FILE_NAME: &str = "config.toml";
+const CONFIG_DIR_NAME: &str = "serial_tool";
 
 struct StatusBanner {
     text: String,
     is_error: bool,
+}
+
+#[derive(Default)]
+struct AppConfig {
+    selected_port: Option<String>,
+    selected_baud: Option<u32>,
+}
+
+impl AppConfig {
+    fn load() -> Self {
+        let Some(path) = config_file_path() else {
+            return Self::default();
+        };
+
+        let Ok(contents) = fs::read_to_string(path) else {
+            return Self::default();
+        };
+
+        parse_config(&contents)
+    }
+
+    fn save(&self) {
+        let Some(path) = config_file_path() else {
+            return;
+        };
+
+        let Some(parent) = path.parent() else {
+            return;
+        };
+
+        if fs::create_dir_all(parent).is_err() {
+            return;
+        }
+
+        let _ = fs::write(path, self.to_toml());
+    }
+
+    fn to_toml(&self) -> String {
+        let mut content = String::new();
+
+        if let Some(port) = &self.selected_port {
+            content.push_str("selected_port = \"");
+            content.push_str(&escape_toml_string(port));
+            content.push_str("\"\n");
+        }
+
+        if let Some(baud) = self.selected_baud {
+            content.push_str(&format!("selected_baud = {baud}\n"));
+        }
+
+        content
+    }
 }
 
 struct SendInput {
@@ -96,12 +152,13 @@ pub struct SerialToolApp {
 impl SerialToolApp {
     pub fn new(cc: &CreationContext<'_>) -> Self {
         setup_fonts(&cc.egui_ctx);
+        let config = AppConfig::load();
 
         let mut app = Self {
             ports: Vec::new(),
-            selected_port: None,
+            selected_port: config.selected_port,
             baud_rates: vec![9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600],
-            selected_baud: DEFAULT_BAUD_RATE,
+            selected_baud: config.selected_baud.unwrap_or(DEFAULT_BAUD_RATE),
             connection: None,
             receive_log: Vec::new(),
             send_log: Vec::new(),
@@ -149,6 +206,14 @@ impl SerialToolApp {
 
     fn set_status(&mut self, text: String, is_error: bool) {
         self.status = Some(StatusBanner { text, is_error });
+    }
+
+    fn save_selection_config(&self) {
+        AppConfig {
+            selected_port: self.selected_port.clone(),
+            selected_baud: Some(self.selected_baud),
+        }
+        .save();
     }
 
     fn open_port(&mut self) {
@@ -358,6 +423,7 @@ impl eframe::App for SerialToolApp {
         let mut open_or_close_requested = false;
         let mut send_requested = false;
         let mut add_input_requested = false;
+        let mut selection_changed = false;
         let mut remove_input_index: Option<usize> = None;
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -371,11 +437,16 @@ impl eframe::App for SerialToolApp {
                         )
                         .show_ui(ui, |ui| {
                             for port in &self.ports {
-                                ui.selectable_value(
-                                    &mut self.selected_port,
-                                    Some(port.clone()),
-                                    port,
-                                );
+                                if ui
+                                    .selectable_value(
+                                        &mut self.selected_port,
+                                        Some(port.clone()),
+                                        port,
+                                    )
+                                    .changed()
+                                {
+                                    selection_changed = true;
+                                }
                             }
                         });
 
@@ -383,11 +454,16 @@ impl eframe::App for SerialToolApp {
                         .selected_text(self.selected_baud.to_string())
                         .show_ui(ui, |ui| {
                             for baud in &self.baud_rates {
-                                ui.selectable_value(
-                                    &mut self.selected_baud,
-                                    *baud,
-                                    baud.to_string(),
-                                );
+                                if ui
+                                    .selectable_value(
+                                        &mut self.selected_baud,
+                                        *baud,
+                                        baud.to_string(),
+                                    )
+                                    .changed()
+                                {
+                                    selection_changed = true;
+                                }
                             }
                         });
 
@@ -593,6 +669,10 @@ impl eframe::App for SerialToolApp {
             self.send_inputs.push(SendInput::new());
         }
 
+        if selection_changed {
+            self.save_selection_config();
+        }
+
         if refresh_requested {
             self.refresh_ports();
         }
@@ -673,4 +753,125 @@ fn format_receive_text(timestamp: &str, bytes: &[u8]) -> String {
         .replace('\r', "\\r")
         .replace('\n', "\\n");
     format!("[{timestamp}] {text}")
+}
+
+fn config_file_path() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    let base_dir = env::var_os("APPDATA").map(PathBuf::from);
+
+    #[cfg(target_os = "macos")]
+    let base_dir = env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join("Library").join("Application Support"));
+
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    let base_dir = env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")));
+
+    base_dir.map(|dir| dir.join(CONFIG_DIR_NAME).join(CONFIG_FILE_NAME))
+}
+
+fn parse_config(contents: &str) -> AppConfig {
+    let mut config = AppConfig::default();
+
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+
+        let key = key.trim();
+        let value = value.trim();
+
+        match key {
+            "selected_port" => {
+                config.selected_port = parse_toml_string(value);
+            }
+            "selected_baud" => {
+                config.selected_baud = value.parse().ok();
+            }
+            _ => {}
+        }
+    }
+
+    config
+}
+
+fn parse_toml_string(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    let inner = trimmed.strip_prefix('"')?.strip_suffix('"')?;
+    let mut result = String::new();
+    let mut chars = inner.chars();
+
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            result.push(ch);
+            continue;
+        }
+
+        match chars.next() {
+            Some('\\') => result.push('\\'),
+            Some('"') => result.push('"'),
+            Some('n') => result.push('\n'),
+            Some('r') => result.push('\r'),
+            Some('t') => result.push('\t'),
+            Some(other) => {
+                result.push('\\');
+                result.push(other);
+            }
+            None => result.push('\\'),
+        }
+    }
+
+    Some(result)
+}
+
+fn escape_toml_string(value: &str) -> String {
+    let mut escaped = String::new();
+
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            other => escaped.push(other),
+        }
+    }
+
+    escaped
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{escape_toml_string, parse_config};
+
+    #[test]
+    fn parse_config_reads_saved_values() {
+        let config = parse_config("selected_port = \"COM3\"\nselected_baud = 57600\n");
+
+        assert_eq!(config.selected_port.as_deref(), Some("COM3"));
+        assert_eq!(config.selected_baud, Some(57600));
+    }
+
+    #[test]
+    fn parse_config_unescapes_port_name() {
+        let config = parse_config("selected_port = \"tty\\\"USB0\\\\A\"\n");
+
+        assert_eq!(config.selected_port.as_deref(), Some("tty\"USB0\\A"));
+    }
+
+    #[test]
+    fn escape_toml_string_escapes_reserved_characters() {
+        assert_eq!(
+            escape_toml_string("tty\"USB0\\A"),
+            "tty\\\"USB0\\\\A".to_owned()
+        );
+    }
 }
