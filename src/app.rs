@@ -12,6 +12,7 @@ use eframe::{
 };
 
 use crate::serial_worker::{SerialConnection, WorkerEvent};
+use serialport::{DataBits, Parity, StopBits};
 
 const MAX_LOG_ENTRIES: usize = 1000;
 const DEFAULT_BAUD_RATE: u32 = 115200;
@@ -24,10 +25,75 @@ struct StatusBanner {
     is_error: bool,
 }
 
+/// 一条收发日志，两种显示格式在追加时一次性构建并缓存，
+/// 避免每帧对全部日志重新格式化。
+struct LogEntry {
+    hex_line: String,
+    text_line: String,
+}
+
+impl LogEntry {
+    fn new(timestamp: &str, bytes: &[u8]) -> Self {
+        Self {
+            hex_line: format_receive_hex(timestamp, bytes),
+            text_line: format_receive_text(timestamp, bytes),
+        }
+    }
+}
+
+/// 发送时末尾追加的换行方式
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NewlineMode {
+    None,
+    CrLf,
+    Lf,
+}
+
+impl NewlineMode {
+    fn suffix(self) -> &'static [u8] {
+        match self {
+            NewlineMode::None => &[],
+            NewlineMode::CrLf => b"\r\n",
+            NewlineMode::Lf => b"\n",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            NewlineMode::None => "无",
+            NewlineMode::CrLf => "CRLF",
+            NewlineMode::Lf => "LF",
+        }
+    }
+
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "none" => Some(Self::None),
+            "crlf" => Some(Self::CrLf),
+            "lf" => Some(Self::Lf),
+            _ => None,
+        }
+    }
+
+    fn to_str(self) -> &'static str {
+        match self {
+            NewlineMode::None => "none",
+            NewlineMode::CrLf => "crlf",
+            NewlineMode::Lf => "lf",
+        }
+    }
+}
+
 #[derive(Default)]
 struct AppConfig {
     selected_port: Option<String>,
     selected_baud: Option<u32>,
+    selected_interval_ms: Option<u64>,
+    receive_as_hex: Option<bool>,
+    newline_mode: Option<String>,
+    data_bits: Option<String>,
+    stop_bits: Option<String>,
+    parity: Option<String>,
 }
 
 impl AppConfig {
@@ -70,6 +136,30 @@ impl AppConfig {
 
         if let Some(baud) = self.selected_baud {
             content.push_str(&format!("selected_baud = {baud}\n"));
+        }
+
+        if let Some(interval) = self.selected_interval_ms {
+            content.push_str(&format!("selected_interval_ms = {interval}\n"));
+        }
+
+        if let Some(hex) = self.receive_as_hex {
+            content.push_str(&format!("receive_as_hex = {hex}\n"));
+        }
+
+        if let Some(mode) = &self.newline_mode {
+            content.push_str(&format!("newline_mode = \"{mode}\"\n"));
+        }
+
+        if let Some(bits) = &self.data_bits {
+            content.push_str(&format!("data_bits = \"{bits}\"\n"));
+        }
+
+        if let Some(bits) = &self.stop_bits {
+            content.push_str(&format!("stop_bits = \"{bits}\"\n"));
+        }
+
+        if let Some(parity) = &self.parity {
+            content.push_str(&format!("parity = \"{parity}\"\n"));
         }
 
         content
@@ -118,7 +208,6 @@ impl SendInput {
     fn to_bytes(&self) -> Result<Vec<u8>, String> {
         if self.is_hex {
             self.text
-                .trim()
                 .split_whitespace()
                 .map(|token| {
                     u8::from_str_radix(token, 16)
@@ -137,12 +226,18 @@ pub struct SerialToolApp {
     baud_rates: Vec<u32>,
     selected_baud: u32,
     connection: Option<SerialConnection>,
-    receive_log: Vec<(String, Vec<u8>)>,
-    send_log: Vec<(String, Vec<u8>)>,
+    receive_log: Vec<LogEntry>,
+    send_log: Vec<LogEntry>,
     receive_as_hex: bool,
     send_inputs: Vec<SendInput>,
     interval_options: Vec<u64>,
     selected_interval_ms: u64,
+    newline_mode: NewlineMode,
+    selected_data_bits: DataBits,
+    selected_stop_bits: StopBits,
+    selected_parity: Parity,
+    dtr: bool,
+    rts: bool,
     continuous_enabled: bool,
     continuous_active: bool,
     next_continuous_send_at: Option<Instant>,
@@ -156,13 +251,13 @@ impl SerialToolApp {
 
         let mut app = Self {
             ports: Vec::new(),
-            selected_port: config.selected_port,
+            selected_port: config.selected_port.clone(),
             baud_rates: vec![9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600],
             selected_baud: config.selected_baud.unwrap_or(DEFAULT_BAUD_RATE),
             connection: None,
             receive_log: Vec::new(),
             send_log: Vec::new(),
-            receive_as_hex: false,
+            receive_as_hex: config.receive_as_hex.unwrap_or(false),
             send_inputs: vec![SendInput::new()],
             interval_options: vec![100, 200, 500, 1000, 2000, 5000],
             selected_interval_ms: DEFAULT_INTERVAL_MS,
@@ -170,10 +265,51 @@ impl SerialToolApp {
             continuous_active: false,
             next_continuous_send_at: None,
             status: None,
+            newline_mode: NewlineMode::None,
+            selected_data_bits: DataBits::Eight,
+            selected_stop_bits: StopBits::One,
+            selected_parity: Parity::None,
+            dtr: false,
+            rts: false,
         };
 
+        app.apply_config(&config);
         app.refresh_ports();
         app
+    }
+
+    fn apply_config(&mut self, config: &AppConfig) {
+        if let Some(interval) = config.selected_interval_ms {
+            self.selected_interval_ms = interval;
+        }
+
+        if let Some(hex) = config.receive_as_hex {
+            self.receive_as_hex = hex;
+        }
+
+        if let Some(mode) = config
+            .newline_mode
+            .as_deref()
+            .and_then(NewlineMode::from_str)
+        {
+            self.newline_mode = mode;
+        }
+
+        self.selected_data_bits = match config.data_bits.as_deref() {
+            Some("5") => DataBits::Five,
+            Some("6") => DataBits::Six,
+            Some("7") => DataBits::Seven,
+            _ => DataBits::Eight,
+        };
+        self.selected_stop_bits = match config.stop_bits.as_deref() {
+            Some("two") => StopBits::Two,
+            _ => StopBits::One,
+        };
+        self.selected_parity = match config.parity.as_deref() {
+            Some("even") => Parity::Even,
+            Some("odd") => Parity::Odd,
+            _ => Parity::None,
+        };
     }
 
     fn refresh_ports(&mut self) {
@@ -208,10 +344,42 @@ impl SerialToolApp {
         self.status = Some(StatusBanner { text, is_error });
     }
 
-    fn save_selection_config(&self) {
+    fn stop_continuous(&mut self) {
+        self.continuous_active = false;
+        self.next_continuous_send_at = None;
+    }
+
+    fn save_config(&self) {
         AppConfig {
             selected_port: self.selected_port.clone(),
             selected_baud: Some(self.selected_baud),
+            selected_interval_ms: Some(self.selected_interval_ms),
+            receive_as_hex: Some(self.receive_as_hex),
+            newline_mode: Some(self.newline_mode.to_str().to_owned()),
+            data_bits: Some(
+                match self.selected_data_bits {
+                    DataBits::Five => "5",
+                    DataBits::Six => "6",
+                    DataBits::Seven => "7",
+                    DataBits::Eight => "8",
+                }
+                .to_owned(),
+            ),
+            stop_bits: Some(
+                match self.selected_stop_bits {
+                    StopBits::One => "one",
+                    StopBits::Two => "two",
+                }
+                .to_owned(),
+            ),
+            parity: Some(
+                match self.selected_parity {
+                    Parity::None => "none",
+                    Parity::Even => "even",
+                    Parity::Odd => "odd",
+                }
+                .to_owned(),
+            ),
         }
         .save();
     }
@@ -222,11 +390,18 @@ impl SerialToolApp {
             return;
         };
 
-        match SerialConnection::open(&port_name, self.selected_baud) {
+        match SerialConnection::open(
+            &port_name,
+            self.selected_baud,
+            self.selected_data_bits,
+            self.selected_stop_bits,
+            self.selected_parity,
+        ) {
             Ok(connection) => {
                 self.connection = Some(connection);
-                self.continuous_active = false;
-                self.next_continuous_send_at = None;
+                self.dtr = false;
+                self.rts = false;
+                self.stop_continuous();
                 self.set_status(
                     format!("已打开串口：{port_name} @ {} baud", self.selected_baud),
                     false,
@@ -237,9 +412,10 @@ impl SerialToolApp {
     }
 
     fn close_port(&mut self) {
-        self.continuous_active = false;
-        self.next_continuous_send_at = None;
+        self.stop_continuous();
         self.connection.take();
+        self.dtr = false;
+        self.rts = false;
         self.set_status("串口已关闭".to_owned(), false);
     }
 
@@ -262,14 +438,12 @@ impl SerialToolApp {
             match event {
                 Some(WorkerEvent::Received(bytes)) => self.push_receive_log(bytes),
                 Some(WorkerEvent::Closed(message)) => {
-                    self.continuous_active = false;
-                    self.next_continuous_send_at = None;
+                    self.stop_continuous();
                     self.set_status(message, false);
                     should_drop_connection = true;
                 }
                 Some(WorkerEvent::Error(message)) => {
-                    self.continuous_active = false;
-                    self.next_continuous_send_at = None;
+                    self.stop_continuous();
                     self.set_status(message, true);
                     should_drop_connection = true;
                 }
@@ -284,7 +458,7 @@ impl SerialToolApp {
 
     fn push_receive_log(&mut self, bytes: Vec<u8>) {
         let timestamp = Local::now().format("%H:%M:%S%.3f").to_string();
-        self.receive_log.push((timestamp, bytes));
+        self.receive_log.push(LogEntry::new(&timestamp, &bytes));
 
         if self.receive_log.len() > MAX_LOG_ENTRIES {
             let overflow = self.receive_log.len() - MAX_LOG_ENTRIES;
@@ -294,7 +468,7 @@ impl SerialToolApp {
 
     fn push_send_log(&mut self, bytes: Vec<u8>) {
         let timestamp = Local::now().format("%H:%M:%S%.3f").to_string();
-        self.send_log.push((timestamp, bytes));
+        self.send_log.push(LogEntry::new(&timestamp, &bytes));
 
         if self.send_log.len() > MAX_LOG_ENTRIES {
             let overflow = self.send_log.len() - MAX_LOG_ENTRIES;
@@ -319,7 +493,9 @@ impl SerialToolApp {
                 ));
             }
 
-            payloads.push(input.to_bytes()?);
+            let mut bytes = input.to_bytes()?;
+            bytes.extend_from_slice(self.newline_mode.suffix());
+            payloads.push(bytes);
         }
 
         if !found_non_empty {
@@ -333,30 +509,32 @@ impl SerialToolApp {
         let payloads = match self.collect_payloads() {
             Ok(payloads) => payloads,
             Err(err) => {
+                // 输入非法（如 HEX 格式错误、全空）时停止持续发送，避免每帧重试的忙循环
+                self.stop_continuous();
                 self.set_status(err, true);
                 return false;
             }
         };
 
-        // Log what we're about to send
-        for bytes in &payloads {
-            self.push_send_log(bytes.clone());
-        }
-
-        // Short-lived borrow of connection for sending
         let result = match self.connection.as_ref() {
-            Some(conn) => conn.send_bytes(payloads),
+            Some(conn) => conn.send_bytes(payloads.clone()),
             None => {
+                self.stop_continuous();
                 self.set_status("请先打开串口".to_owned(), true);
                 return false;
             }
         };
 
         match result {
-            Ok(()) => true,
+            Ok(()) => {
+                // 仅在成功提交给串口后台线程后才记录发送日志
+                for bytes in &payloads {
+                    self.push_send_log(bytes.clone());
+                }
+                true
+            }
             Err(err) => {
-                self.continuous_active = false;
-                self.next_continuous_send_at = None;
+                self.stop_continuous();
                 self.set_status(format!("发送失败：{err}"), true);
                 false
             }
@@ -366,8 +544,7 @@ impl SerialToolApp {
     fn handle_send_button(&mut self) {
         if self.continuous_enabled {
             if self.continuous_active {
-                self.continuous_active = false;
-                self.next_continuous_send_at = None;
+                self.stop_continuous();
                 self.set_status("已停止持续发送".to_owned(), false);
                 return;
             }
@@ -423,7 +600,7 @@ impl eframe::App for SerialToolApp {
         let mut open_or_close_requested = false;
         let mut send_requested = false;
         let mut add_input_requested = false;
-        let mut selection_changed = false;
+        let mut settings_changed = false;
         let mut remove_input_index: Option<usize> = None;
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -445,7 +622,7 @@ impl eframe::App for SerialToolApp {
                                     )
                                     .changed()
                                 {
-                                    selection_changed = true;
+                                    settings_changed = true;
                                 }
                             }
                         });
@@ -462,10 +639,22 @@ impl eframe::App for SerialToolApp {
                                     )
                                     .changed()
                                 {
-                                    selection_changed = true;
+                                    settings_changed = true;
                                 }
                             }
                         });
+
+                    // 自定义波特率：可直接输入任意值
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut self.selected_baud)
+                                .range(1..=4_000_000)
+                                .speed(100),
+                        )
+                        .changed()
+                    {
+                        settings_changed = true;
+                    }
 
                     if ui.button("刷新").clicked() {
                         refresh_requested = true;
@@ -477,7 +666,87 @@ impl eframe::App for SerialToolApp {
                     open_or_close_requested = true;
                 }
 
-                ui.checkbox(&mut self.receive_as_hex, "HEX 显示");
+                if ui.checkbox(&mut self.receive_as_hex, "HEX 显示").changed() {
+                    settings_changed = true;
+                }
+            });
+
+            // -- 串口参数 --
+            ui.horizontal(|ui| {
+                ui.add_enabled_ui(!is_open, |ui| {
+                    egui::ComboBox::from_label("数据位")
+                        .selected_text(match self.selected_data_bits {
+                            DataBits::Five => "5",
+                            DataBits::Six => "6",
+                            DataBits::Seven => "7",
+                            DataBits::Eight => "8",
+                        })
+                        .show_ui(ui, |ui| {
+                            for (bits, label) in [
+                                (DataBits::Five, "5"),
+                                (DataBits::Six, "6"),
+                                (DataBits::Seven, "7"),
+                                (DataBits::Eight, "8"),
+                            ] {
+                                if ui
+                                    .selectable_value(&mut self.selected_data_bits, bits, label)
+                                    .changed()
+                                {
+                                    settings_changed = true;
+                                }
+                            }
+                        });
+
+                    egui::ComboBox::from_label("停止位")
+                        .selected_text(match self.selected_stop_bits {
+                            StopBits::One => "1",
+                            StopBits::Two => "2",
+                        })
+                        .show_ui(ui, |ui| {
+                            for (bits, label) in [(StopBits::One, "1"), (StopBits::Two, "2")] {
+                                if ui
+                                    .selectable_value(&mut self.selected_stop_bits, bits, label)
+                                    .changed()
+                                {
+                                    settings_changed = true;
+                                }
+                            }
+                        });
+
+                    egui::ComboBox::from_label("校验位")
+                        .selected_text(match self.selected_parity {
+                            Parity::None => "无",
+                            Parity::Even => "偶校验",
+                            Parity::Odd => "奇校验",
+                        })
+                        .show_ui(ui, |ui| {
+                            for (parity, label) in [
+                                (Parity::None, "无"),
+                                (Parity::Even, "偶校验"),
+                                (Parity::Odd, "奇校验"),
+                            ] {
+                                if ui
+                                    .selectable_value(&mut self.selected_parity, parity, label)
+                                    .changed()
+                                {
+                                    settings_changed = true;
+                                }
+                            }
+                        });
+                });
+
+                ui.add_enabled_ui(is_open, |ui| {
+                    if ui.checkbox(&mut self.dtr, "DTR").changed() {
+                        if let Some(conn) = self.connection.as_ref() {
+                            let _ = conn.set_dtr(self.dtr);
+                        }
+                    }
+                    if ui.checkbox(&mut self.rts, "RTS").changed() {
+                        if let Some(conn) = self.connection.as_ref() {
+                            let _ = conn.set_rts(self.rts);
+                        }
+                    }
+                });
             });
 
             if let Some(status) = &self.status {
@@ -496,10 +765,21 @@ impl eframe::App for SerialToolApp {
                 // ═══════════ Left column: Send ═══════════
                 columns[0].vertical(|ui| {
                     // -- Send log --
-                    ui.label("发送数据");
+                    ui.horizontal(|ui| {
+                        ui.label("发送数据");
+                        if ui.small_button("清空日志").clicked() {
+                            self.send_log.clear();
+                        }
+                        if ui.small_button("清空输入").clicked() {
+                            for input in &mut self.send_inputs {
+                                input.text.clear();
+                                input.validate();
+                            }
+                        }
+                    });
 
                     let input_count = self.send_inputs.len() as f32;
-                    let controls_height = 85.0 + input_count * 28.0;
+                    let controls_height = 120.0 + input_count * 54.0;
                     let scroll_height = (ui.available_height() - controls_height).max(80.0);
 
                     egui::Frame::group(ui.style())
@@ -517,16 +797,16 @@ impl eframe::App for SerialToolApp {
                                         ui.weak("暂无发送数据");
                                     } else {
                                         let as_hex = self.receive_as_hex;
-                                        for (timestamp, bytes) in &self.send_log {
+                                        for entry in &self.send_log {
                                             let line = if as_hex {
-                                                format_receive_hex(timestamp, bytes)
+                                                &entry.hex_line
                                             } else {
-                                                format_receive_text(timestamp, bytes)
+                                                &entry.text_line
                                             };
                                             // 替换 ui.monospace(line)
                                             ui.add(
                                                 egui::Label::new(
-                                                    egui::RichText::new(line).monospace(),
+                                                    egui::RichText::new(line.as_str()).monospace(),
                                                 )
                                                 .wrap(),
                                             );
@@ -553,8 +833,9 @@ impl eframe::App for SerialToolApp {
                                 "输入要发送的文本"
                             };
                             let response = ui.add(
-                                TextEdit::singleline(&mut input.text)
-                                    .desired_width(200.0)
+                                TextEdit::multiline(&mut input.text)
+                                    .desired_rows(2)
+                                    .desired_width(220.0)
                                     .hint_text(hint),
                             );
 
@@ -604,20 +885,48 @@ impl eframe::App for SerialToolApp {
                                 .selected_text(format!("{} ms", self.selected_interval_ms))
                                 .show_ui(ui, |ui| {
                                     for interval in &self.interval_options {
-                                        ui.selectable_value(
-                                            &mut self.selected_interval_ms,
-                                            *interval,
-                                            format!("{} ms", interval),
-                                        );
+                                        if ui
+                                            .selectable_value(
+                                                &mut self.selected_interval_ms,
+                                                *interval,
+                                                format!("{} ms", interval),
+                                            )
+                                            .changed()
+                                        {
+                                            settings_changed = true;
+                                        }
                                     }
                                 });
                         }
+
+                        egui::ComboBox::from_label("换行")
+                            .selected_text(self.newline_mode.label())
+                            .show_ui(ui, |ui| {
+                                for mode in [NewlineMode::None, NewlineMode::CrLf, NewlineMode::Lf]
+                                {
+                                    if ui
+                                        .selectable_value(
+                                            &mut self.newline_mode,
+                                            mode,
+                                            mode.label(),
+                                        )
+                                        .changed()
+                                    {
+                                        settings_changed = true;
+                                    }
+                                }
+                            });
                     });
                 });
 
                 // ═══════════ Right column: Receive ═══════════
                 columns[1].vertical(|ui| {
-                    ui.label("接收数据");
+                    ui.horizontal(|ui| {
+                        ui.label("接收数据");
+                        if ui.small_button("清空日志").clicked() {
+                            self.receive_log.clear();
+                        }
+                    });
 
                     let scroll_height = ui.available_height() - 32.0;
 
@@ -636,15 +945,15 @@ impl eframe::App for SerialToolApp {
                                         ui.weak("暂无接收数据");
                                     } else {
                                         let as_hex = self.receive_as_hex;
-                                        for (timestamp, bytes) in &self.receive_log {
+                                        for entry in &self.receive_log {
                                             let line = if as_hex {
-                                                format_receive_hex(timestamp, bytes)
+                                                &entry.hex_line
                                             } else {
-                                                format_receive_text(timestamp, bytes)
+                                                &entry.text_line
                                             };
                                             ui.add(
                                                 egui::Label::new(
-                                                    egui::RichText::new(line).monospace(),
+                                                    egui::RichText::new(line.as_str()).monospace(),
                                                 )
                                                 .wrap(),
                                             );
@@ -657,8 +966,7 @@ impl eframe::App for SerialToolApp {
         });
 
         if !self.continuous_enabled && was_continuous_enabled {
-            self.continuous_active = false;
-            self.next_continuous_send_at = None;
+            self.stop_continuous();
         }
 
         if let Some(idx) = remove_input_index {
@@ -669,8 +977,8 @@ impl eframe::App for SerialToolApp {
             self.send_inputs.push(SendInput::new());
         }
 
-        if selection_changed {
-            self.save_selection_config();
+        if settings_changed {
+            self.save_config();
         }
 
         if refresh_requested {
@@ -795,6 +1103,40 @@ fn parse_config(contents: &str) -> AppConfig {
             "selected_baud" => {
                 config.selected_baud = value.parse().ok();
             }
+            "selected_interval_ms" => {
+                config.selected_interval_ms = value.parse().ok();
+            }
+            "receive_as_hex" => {
+                config.receive_as_hex = value.parse().ok();
+            }
+            "newline_mode" => {
+                if let Some(mode) = parse_toml_string(value) {
+                    if matches!(mode.as_str(), "none" | "crlf" | "lf") {
+                        config.newline_mode = Some(mode);
+                    }
+                }
+            }
+            "data_bits" => {
+                if let Some(bits) = parse_toml_string(value) {
+                    if matches!(bits.as_str(), "5" | "6" | "7" | "8") {
+                        config.data_bits = Some(bits);
+                    }
+                }
+            }
+            "stop_bits" => {
+                if let Some(bits) = parse_toml_string(value) {
+                    if matches!(bits.as_str(), "one" | "two") {
+                        config.stop_bits = Some(bits);
+                    }
+                }
+            }
+            "parity" => {
+                if let Some(parity) = parse_toml_string(value) {
+                    if matches!(parity.as_str(), "none" | "even" | "odd") {
+                        config.parity = Some(parity);
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -873,5 +1215,29 @@ mod tests {
             escape_toml_string("tty\"USB0\\A"),
             "tty\\\"USB0\\\\A".to_owned()
         );
+    }
+
+    #[test]
+    fn parse_config_reads_extended_settings() {
+        let config = parse_config(
+            "selected_interval_ms = 500\nreceive_as_hex = true\nnewline_mode = \"crlf\"\ndata_bits = \"7\"\nstop_bits = \"two\"\nparity = \"even\"\n",
+        );
+
+        assert_eq!(config.selected_interval_ms, Some(500));
+        assert_eq!(config.receive_as_hex, Some(true));
+        assert_eq!(config.newline_mode.as_deref(), Some("crlf"));
+        assert_eq!(config.data_bits.as_deref(), Some("7"));
+        assert_eq!(config.stop_bits.as_deref(), Some("two"));
+        assert_eq!(config.parity.as_deref(), Some("even"));
+    }
+
+    #[test]
+    fn parse_config_rejects_invalid_enum_values() {
+        let config =
+            parse_config("newline_mode = \"bogus\"\ndata_bits = \"9\"\nparity = \"weird\"\n");
+
+        assert_eq!(config.newline_mode, None);
+        assert_eq!(config.data_bits, None);
+        assert_eq!(config.parity, None);
     }
 }
