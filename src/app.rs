@@ -41,48 +41,7 @@ impl LogEntry {
     }
 }
 
-/// 发送时末尾追加的换行方式
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum NewlineMode {
-    None,
-    CrLf,
-    Lf,
-}
-
-impl NewlineMode {
-    fn suffix(self) -> &'static [u8] {
-        match self {
-            NewlineMode::None => &[],
-            NewlineMode::CrLf => b"\r\n",
-            NewlineMode::Lf => b"\n",
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            NewlineMode::None => "无",
-            NewlineMode::CrLf => "CRLF",
-            NewlineMode::Lf => "LF",
-        }
-    }
-
-    fn from_str(value: &str) -> Option<Self> {
-        match value {
-            "none" => Some(Self::None),
-            "crlf" => Some(Self::CrLf),
-            "lf" => Some(Self::Lf),
-            _ => None,
-        }
-    }
-
-    fn to_str(self) -> &'static str {
-        match self {
-            NewlineMode::None => "none",
-            NewlineMode::CrLf => "crlf",
-            NewlineMode::Lf => "lf",
-        }
-    }
-}
+/// 发送时每行末尾追加的字节：勾选 +0D 追 0D、勾选 +0A 追 0A、都勾追 0D0A
 
 #[derive(Default)]
 struct AppConfig {
@@ -90,7 +49,6 @@ struct AppConfig {
     selected_baud: Option<u32>,
     selected_interval_ms: Option<u64>,
     receive_as_hex: Option<bool>,
-    newline_mode: Option<String>,
     data_bits: Option<String>,
     stop_bits: Option<String>,
     parity: Option<String>,
@@ -146,10 +104,6 @@ impl AppConfig {
             content.push_str(&format!("receive_as_hex = {hex}\n"));
         }
 
-        if let Some(mode) = &self.newline_mode {
-            content.push_str(&format!("newline_mode = \"{mode}\"\n"));
-        }
-
         if let Some(bits) = &self.data_bits {
             content.push_str(&format!("data_bits = \"{bits}\"\n"));
         }
@@ -170,6 +124,10 @@ struct SendInput {
     text: String,
     is_hex: bool,
     hex_error: Option<String>,
+    /// 在本条数据末尾追加 0D（回车）
+    append_cr: bool,
+    /// 在本条数据末尾追加 0A（换行）
+    append_lf: bool,
 }
 
 impl SendInput {
@@ -178,6 +136,8 @@ impl SendInput {
             text: String::new(),
             is_hex: false,
             hex_error: None,
+            append_cr: false,
+            append_lf: false,
         }
     }
 
@@ -232,7 +192,6 @@ pub struct SerialToolApp {
     send_inputs: Vec<SendInput>,
     interval_options: Vec<u64>,
     selected_interval_ms: u64,
-    newline_mode: NewlineMode,
     selected_data_bits: DataBits,
     selected_stop_bits: StopBits,
     selected_parity: Parity,
@@ -265,7 +224,6 @@ impl SerialToolApp {
             continuous_active: false,
             next_continuous_send_at: None,
             status: None,
-            newline_mode: NewlineMode::None,
             selected_data_bits: DataBits::Eight,
             selected_stop_bits: StopBits::One,
             selected_parity: Parity::None,
@@ -285,14 +243,6 @@ impl SerialToolApp {
 
         if let Some(hex) = config.receive_as_hex {
             self.receive_as_hex = hex;
-        }
-
-        if let Some(mode) = config
-            .newline_mode
-            .as_deref()
-            .and_then(NewlineMode::from_str)
-        {
-            self.newline_mode = mode;
         }
 
         self.selected_data_bits = match config.data_bits.as_deref() {
@@ -355,7 +305,6 @@ impl SerialToolApp {
             selected_baud: Some(self.selected_baud),
             selected_interval_ms: Some(self.selected_interval_ms),
             receive_as_hex: Some(self.receive_as_hex),
-            newline_mode: Some(self.newline_mode.to_str().to_owned()),
             data_bits: Some(
                 match self.selected_data_bits {
                     DataBits::Five => "5",
@@ -494,7 +443,13 @@ impl SerialToolApp {
             }
 
             let mut bytes = input.to_bytes()?;
-            bytes.extend_from_slice(self.newline_mode.suffix());
+            // 行级追加：先 0D 后 0A，两个都勾选 = 追加 0D0A
+            if input.append_cr {
+                bytes.push(0x0D);
+            }
+            if input.append_lf {
+                bytes.push(0x0A);
+            }
             payloads.push(bytes);
         }
 
@@ -847,6 +802,21 @@ impl eframe::App for SerialToolApp {
                                 input.validate();
                             }
 
+                            if ui
+                                .checkbox(&mut input.append_cr, "+0D")
+                                .on_hover_text("在本条数据末尾追加 0D")
+                                .changed()
+                            {
+                                input.validate();
+                            }
+                            if ui
+                                .checkbox(&mut input.append_lf, "+0A")
+                                .on_hover_text("在本条数据末尾追加 0A")
+                                .changed()
+                            {
+                                input.validate();
+                            }
+
                             if let Some(ref err) = input.hex_error {
                                 ui.label(
                                     RichText::new("\u{26a0}").color(Color32::from_rgb(220, 70, 70)),
@@ -898,24 +868,6 @@ impl eframe::App for SerialToolApp {
                                     }
                                 });
                         }
-
-                        egui::ComboBox::from_label("换行")
-                            .selected_text(self.newline_mode.label())
-                            .show_ui(ui, |ui| {
-                                for mode in [NewlineMode::None, NewlineMode::CrLf, NewlineMode::Lf]
-                                {
-                                    if ui
-                                        .selectable_value(
-                                            &mut self.newline_mode,
-                                            mode,
-                                            mode.label(),
-                                        )
-                                        .changed()
-                                    {
-                                        settings_changed = true;
-                                    }
-                                }
-                            });
                     });
                 });
 
@@ -1109,13 +1061,6 @@ fn parse_config(contents: &str) -> AppConfig {
             "receive_as_hex" => {
                 config.receive_as_hex = value.parse().ok();
             }
-            "newline_mode" => {
-                if let Some(mode) = parse_toml_string(value) {
-                    if matches!(mode.as_str(), "none" | "crlf" | "lf") {
-                        config.newline_mode = Some(mode);
-                    }
-                }
-            }
             "data_bits" => {
                 if let Some(bits) = parse_toml_string(value) {
                     if matches!(bits.as_str(), "5" | "6" | "7" | "8") {
@@ -1220,12 +1165,11 @@ mod tests {
     #[test]
     fn parse_config_reads_extended_settings() {
         let config = parse_config(
-            "selected_interval_ms = 500\nreceive_as_hex = true\nnewline_mode = \"crlf\"\ndata_bits = \"7\"\nstop_bits = \"two\"\nparity = \"even\"\n",
+            "selected_interval_ms = 500\nreceive_as_hex = true\ndata_bits = \"7\"\nstop_bits = \"two\"\nparity = \"even\"\n",
         );
 
         assert_eq!(config.selected_interval_ms, Some(500));
         assert_eq!(config.receive_as_hex, Some(true));
-        assert_eq!(config.newline_mode.as_deref(), Some("crlf"));
         assert_eq!(config.data_bits.as_deref(), Some("7"));
         assert_eq!(config.stop_bits.as_deref(), Some("two"));
         assert_eq!(config.parity.as_deref(), Some("even"));
@@ -1233,10 +1177,8 @@ mod tests {
 
     #[test]
     fn parse_config_rejects_invalid_enum_values() {
-        let config =
-            parse_config("newline_mode = \"bogus\"\ndata_bits = \"9\"\nparity = \"weird\"\n");
+        let config = parse_config("data_bits = \"9\"\nparity = \"weird\"\n");
 
-        assert_eq!(config.newline_mode, None);
         assert_eq!(config.data_bits, None);
         assert_eq!(config.parity, None);
     }
