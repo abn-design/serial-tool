@@ -11,7 +11,7 @@ use eframe::{
     CreationContext, Frame,
 };
 
-use crate::serial_worker::{SerialConnection, WorkerEvent};
+use crate::serial_worker::{LineErrorCounts, SerialConnection, WorkerEvent};
 use serialport::{DataBits, Parity, StopBits};
 
 const MAX_LOG_ENTRIES: usize = 1000;
@@ -33,12 +33,105 @@ struct LogEntry {
 }
 
 impl LogEntry {
-    fn new(timestamp: &str, bytes: &[u8]) -> Self {
+    fn new(timestamp: &str, bytes: &[u8], text: String) -> Self {
         Self {
             hex_line: format_receive_hex(timestamp, bytes),
-            text_line: format_receive_text(timestamp, bytes),
+            text_line: format!("[{timestamp}] {text}"),
         }
     }
+}
+
+/// 增量文本解码器。
+///
+/// 串口数据是按驱动缓冲块到达的，一个多字节 UTF-8 字符可能被拆到两次
+/// `Received` 事件里。这里跨块保留不完整字符，避免每个块单独解码时把同一个
+/// 汉字拆成两个 `�`。非法/不完整字节用 `\xNN` 显示，不再静默丢失。
+#[derive(Default)]
+struct TextDecoder {
+    /// 上一次解码遗留的不完整 UTF-8 字节
+    pending: Vec<u8>,
+}
+
+impl TextDecoder {
+    fn reset(&mut self) {
+        self.pending.clear();
+    }
+
+    /// 流式解码，不完整尾部留到下一块继续
+    fn decode(&mut self, bytes: &[u8]) -> String {
+        self.decode_impl(bytes, false)
+    }
+
+    /// 一次性解码，不完整尾部直接转义（用于发送日志）
+    fn decode_all(bytes: &[u8]) -> String {
+        let mut decoder = Self::default();
+        decoder.decode_impl(bytes, true)
+    }
+
+    fn decode_impl(&mut self, bytes: &[u8], flush_incomplete: bool) -> String {
+        self.pending.extend_from_slice(bytes);
+        let mut text = String::new();
+
+        loop {
+            match std::str::from_utf8(&self.pending) {
+                Ok(valid) => {
+                    push_decoded_text(&mut text, valid);
+                    self.pending.clear();
+                    break;
+                }
+                Err(err) => {
+                    let valid_up_to = err.valid_up_to();
+
+                    if let Ok(valid) = std::str::from_utf8(&self.pending[..valid_up_to]) {
+                        push_decoded_text(&mut text, valid);
+                    }
+
+                    match err.error_len() {
+                        Some(len) => {
+                            let end = valid_up_to + len;
+                            for byte in &self.pending[valid_up_to..end] {
+                                push_byte_escape(&mut text, *byte);
+                            }
+                            self.pending.drain(..end);
+                        }
+                        None => {
+                            // 末尾是不完整的多字节字符
+                            if flush_incomplete {
+                                for byte in &self.pending[valid_up_to..] {
+                                    push_byte_escape(&mut text, *byte);
+                                }
+                                self.pending.clear();
+                            } else {
+                                self.pending.drain(..valid_up_to);
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        text
+    }
+}
+
+/// 追加文本，`\r`/`\n` 及不可见的 ASCII 控制字符转义显示
+fn push_decoded_text(out: &mut String, text: &str) {
+    for ch in text.chars() {
+        match ch {
+            '\r' => out.push_str("\\r"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push('\t'),
+            ch if (ch as u32) < 0x20 || ch as u32 == 0x7F => {
+                out.push_str(&format!("\\x{:02X}", ch as u32));
+            }
+            ch => out.push(ch),
+        }
+    }
+}
+
+fn push_byte_escape(out: &mut String, byte: u8) {
+    out.push_str(&format!("\\x{byte:02X}"));
 }
 
 /// 发送时每行末尾追加的字节：勾选 +0D 追 0D、勾选 +0A 追 0A、都勾追 0D0A
@@ -189,6 +282,10 @@ pub struct SerialToolApp {
     receive_log: Vec<LogEntry>,
     send_log: Vec<LogEntry>,
     receive_as_hex: bool,
+    /// 接收文本的增量解码状态
+    receive_decoder: TextDecoder,
+    /// 自打开端口以来累计的线路错误
+    line_errors: LineErrorCounts,
     send_inputs: Vec<SendInput>,
     interval_options: Vec<u64>,
     selected_interval_ms: u64,
@@ -217,6 +314,8 @@ impl SerialToolApp {
             receive_log: Vec::new(),
             send_log: Vec::new(),
             receive_as_hex: config.receive_as_hex.unwrap_or(false),
+            receive_decoder: TextDecoder::default(),
+            line_errors: LineErrorCounts::default(),
             send_inputs: vec![SendInput::new()],
             interval_options: vec![100, 200, 500, 1000, 2000, 5000],
             selected_interval_ms: DEFAULT_INTERVAL_MS,
@@ -260,6 +359,47 @@ impl SerialToolApp {
             Some("odd") => Parity::Odd,
             _ => Parity::None,
         };
+    }
+
+    /// 帧格式缩写，例如 `8N1`
+    fn frame_format_short(&self) -> String {
+        let data = match self.selected_data_bits {
+            DataBits::Five => "5",
+            DataBits::Six => "6",
+            DataBits::Seven => "7",
+            DataBits::Eight => "8",
+        };
+        let parity = match self.selected_parity {
+            Parity::None => "N",
+            Parity::Even => "E",
+            Parity::Odd => "O",
+        };
+        let stop = match self.selected_stop_bits {
+            StopBits::One => "1",
+            StopBits::Two => "2",
+        };
+
+        format!("{data}{parity}{stop}")
+    }
+
+    fn frame_format_description(&self) -> String {
+        let data = match self.selected_data_bits {
+            DataBits::Five => "5",
+            DataBits::Six => "6",
+            DataBits::Seven => "7",
+            DataBits::Eight => "8",
+        };
+        let parity = match self.selected_parity {
+            Parity::None => "无校验",
+            Parity::Even => "偶校验",
+            Parity::Odd => "奇校验",
+        };
+        let stop = match self.selected_stop_bits {
+            StopBits::One => "1 位",
+            StopBits::Two => "2 位",
+        };
+
+        format!("{data} 数据位 / {parity} / 停止位 {stop}")
     }
 
     fn refresh_ports(&mut self) {
@@ -350,9 +490,15 @@ impl SerialToolApp {
                 self.connection = Some(connection);
                 self.dtr = false;
                 self.rts = false;
+                self.line_errors = LineErrorCounts::default();
+                self.receive_decoder.reset();
                 self.stop_continuous();
                 self.set_status(
-                    format!("已打开串口：{port_name} @ {} baud", self.selected_baud),
+                    format!(
+                        "已打开串口：{port_name} @ {} baud，帧格式 {}",
+                        self.selected_baud,
+                        self.frame_format_short()
+                    ),
                     false,
                 );
             }
@@ -365,6 +511,8 @@ impl SerialToolApp {
         self.connection.take();
         self.dtr = false;
         self.rts = false;
+        self.line_errors = LineErrorCounts::default();
+        self.receive_decoder.reset();
         self.set_status("串口已关闭".to_owned(), false);
     }
 
@@ -386,6 +534,18 @@ impl SerialToolApp {
 
             match event {
                 Some(WorkerEvent::Received(bytes)) => self.push_receive_log(bytes),
+                Some(WorkerEvent::LineError(counts)) => {
+                    let first_error = self.line_errors.is_zero();
+                    self.line_errors = counts;
+
+                    if first_error {
+                        self.set_status(
+                            "检测到串口线路错误（帧/校验/溢出），请核对两侧波特率与帧格式"
+                                .to_owned(),
+                            true,
+                        );
+                    }
+                }
                 Some(WorkerEvent::Closed(message)) => {
                     self.stop_continuous();
                     self.set_status(message, false);
@@ -407,7 +567,9 @@ impl SerialToolApp {
 
     fn push_receive_log(&mut self, bytes: Vec<u8>) {
         let timestamp = Local::now().format("%H:%M:%S%.3f").to_string();
-        self.receive_log.push(LogEntry::new(&timestamp, &bytes));
+        let text = self.receive_decoder.decode(&bytes);
+        self.receive_log
+            .push(LogEntry::new(&timestamp, &bytes, text));
 
         if self.receive_log.len() > MAX_LOG_ENTRIES {
             let overflow = self.receive_log.len() - MAX_LOG_ENTRIES;
@@ -417,7 +579,8 @@ impl SerialToolApp {
 
     fn push_send_log(&mut self, bytes: Vec<u8>) {
         let timestamp = Local::now().format("%H:%M:%S%.3f").to_string();
-        self.send_log.push(LogEntry::new(&timestamp, &bytes));
+        let text = TextDecoder::decode_all(&bytes);
+        self.send_log.push(LogEntry::new(&timestamp, &bytes, text));
 
         if self.send_log.len() > MAX_LOG_ENTRIES {
             let overflow = self.send_log.len() - MAX_LOG_ENTRIES;
@@ -702,6 +865,17 @@ impl eframe::App for SerialToolApp {
                         }
                     }
                 });
+
+                ui.separator();
+                ui.label(
+                    RichText::new(format!(
+                        "当前：{} bps · {}",
+                        self.selected_baud,
+                        self.frame_format_short()
+                    ))
+                    .weak(),
+                )
+                .on_hover_text(self.frame_format_description());
             });
 
             if let Some(status) = &self.status {
@@ -877,6 +1051,23 @@ impl eframe::App for SerialToolApp {
                         ui.label("接收数据");
                         if ui.small_button("清空日志").clicked() {
                             self.receive_log.clear();
+                            self.receive_decoder.reset();
+                        }
+
+                        if !self.line_errors.is_zero() {
+                            ui.separator();
+                            ui.label(
+                                RichText::new(format!(
+                                    "线路错误 帧 {} · 校验 {} · 溢出 {}",
+                                    self.line_errors.framing,
+                                    self.line_errors.parity,
+                                    self.line_errors.overrun
+                                ))
+                                .color(Color32::from_rgb(220, 140, 60)),
+                            )
+                            .on_hover_text(
+                                "驱动上报的接收错误计数（Windows 按轮询批次累计，Linux 为驱动精确计数），通常表示波特率/数据位/校验位与对端不一致，或线路干扰",
+                            );
                         }
                     });
 
@@ -1008,13 +1199,6 @@ fn format_receive_hex(timestamp: &str, bytes: &[u8]) -> String {
     format!("[{timestamp}] {hex}")
 }
 
-fn format_receive_text(timestamp: &str, bytes: &[u8]) -> String {
-    let text = String::from_utf8_lossy(bytes)
-        .replace('\r', "\\r")
-        .replace('\n', "\\n");
-    format!("[{timestamp}] {text}")
-}
-
 fn config_file_path() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     let base_dir = env::var_os("APPDATA").map(PathBuf::from);
@@ -1137,7 +1321,7 @@ fn escape_toml_string(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{escape_toml_string, parse_config};
+    use super::{escape_toml_string, parse_config, TextDecoder};
 
     #[test]
     fn parse_config_reads_saved_values() {
@@ -1181,5 +1365,32 @@ mod tests {
 
         assert_eq!(config.data_bits, None);
         assert_eq!(config.parity, None);
+    }
+
+    #[test]
+    fn text_decoder_keeps_split_utf8_character() {
+        let mut decoder = TextDecoder::default();
+        let bytes = "中".as_bytes();
+
+        assert_eq!(decoder.decode(&bytes[..1]), "");
+        assert_eq!(decoder.decode(&bytes[1..]), "中");
+    }
+
+    #[test]
+    fn text_decoder_escapes_invalid_bytes() {
+        assert_eq!(TextDecoder::decode_all(&[0xC4, 0xE3]), "\\xC4\\xE3");
+        assert_eq!(TextDecoder::decode_all(&[0x00, 0xFF]), "\\x00\\xFF");
+    }
+
+    #[test]
+    fn text_decoder_escapes_line_breaks() {
+        assert_eq!(TextDecoder::decode_all(b"hi\r\n"), "hi\\r\\n");
+    }
+
+    #[test]
+    fn text_decoder_flushes_incomplete_tail() {
+        let bytes = "中".as_bytes();
+
+        assert_eq!(TextDecoder::decode_all(&bytes[..2]), "\\xE4\\xB8");
     }
 }
